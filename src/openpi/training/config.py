@@ -485,6 +485,24 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # DDP gradient bucket size in MiB for PyTorch DistributedDataParallel.
+    ddp_bucket_cap_mb: int = 25
+
+    # Whether DDP should traverse the autograd graph to find unused parameters.
+    ddp_find_unused_parameters: bool = True
+
+    # PI0Pytorch top-level activation checkpoint wrapper.
+    # Default False: redundant when per-layer GC is active (causes 2x recomputation).
+    # Only enable if per-layer GC is disabled AND memory is insufficient.
+    pytorch_gradient_checkpointing: bool = False
+
+    # Per-layer gradient checkpointing interval inside PaliGemmaWithExpertModel.
+    # 1 = checkpoint every layer (default, most memory-efficient).
+    # 2 = checkpoint every 2nd layer (saves ~50% recompute).
+    # 3 = checkpoint every 3rd layer (saves ~67% recompute).
+    # 0 = disable per-layer checkpointing entirely (highest memory).
+    gemma_gc_every_n_layers: int = 1
+
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99

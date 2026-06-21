@@ -15,6 +15,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        compile_forward_mode: str | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -56,6 +57,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+
+        if compile_forward_mode is not None:
+            self.forward = torch.compile(self.forward, mode=compile_forward_mode)
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -126,32 +130,15 @@ class PaliGemmaWithExpertModel(nn.Module):
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
-            # Check if gradient checkpointing is enabled for any of the models
-            use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
-                and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
-            # Force enable gradient checkpointing if we're in training mode and the model supports it
-            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                if not self.gemma_expert.model.gradient_checkpointing:
-                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
-                    self.gemma_expert.model.gradient_checkpointing = True
-                use_gradient_checkpointing = True
-
-            # Debug gradient checkpointing status
-            if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
-                print(f"Gemma expert model gradient checkpointing: {use_gradient_checkpointing}")
-                print(f"Model training mode: {self.training}")
-                print(
-                    f"Gemma expert model has gradient_checkpointing attr: {hasattr(self.gemma_expert.model, 'gradient_checkpointing')}"
-                )
-                if hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                    print(
-                        f"Gemma expert model gradient_checkpointing value: {self.gemma_expert.model.gradient_checkpointing}"
-                    )
-                self._debug_gc_printed = True
+            # Check if gradient checkpointing is enabled for any of the models.
+            # NOTE: avoid print() or attribute mutations here — they cause graph breaks
+            # and recompiles under torch.compile.
+            gc_every_n = getattr(self, "gc_every_n_layers", 1)
+            use_gradient_checkpointing = gc_every_n > 0 and (
+                (getattr(self.gemma_expert.model, "gradient_checkpointing", False) and self.training)
+                or (getattr(self, "gradient_checkpointing", False) and self.training)
+                or (gc_every_n >= 1 and self.training)
+            )
 
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
@@ -205,9 +192,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                     attention_mask,
                     scaling,
                 )
-                # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
-                att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+                att_output = att_output.reshape(batch_size, -1, query_states.shape[1] * head_dim)
 
                 # Process layer outputs
                 outputs_embeds = []
@@ -236,9 +222,13 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                 return outputs_embeds
 
-            # Process all layers with gradient checkpointing if enabled
+            # Process all layers with selective gradient checkpointing
             for layer_idx in range(num_layers):
-                if use_gradient_checkpointing:
+                should_checkpoint = (
+                    use_gradient_checkpointing and gc_every_n > 0 and (layer_idx % gc_every_n == 0)
+                )
+
+                if should_checkpoint:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
                         layer_idx,

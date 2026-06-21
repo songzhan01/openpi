@@ -33,19 +33,23 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    pytorch_compile_gemma_mode: str | None = None
 
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        valid_pytorch_compile_modes = [
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ]
         if self.pytorch_compile_mode is not None:
-            assert self.pytorch_compile_mode in [
-                "default",
-                "reduce-overhead",
-                "max-autotune",
-                "max-autotune-no-cudagraphs",
-            ]
+            assert self.pytorch_compile_mode in valid_pytorch_compile_modes
+        if self.pytorch_compile_gemma_mode is not None:
+            assert self.pytorch_compile_gemma_mode in valid_pytorch_compile_modes
 
     @property
     @override

@@ -408,13 +408,19 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
+    if config.pytorch_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
+        logging.warning(
+            "Top-level GC enabled — this is redundant with per-layer GC and causes 2x recomputation. "
+            "Consider using --no-pytorch-gradient-checkpointing unless per-layer GC is disabled."
+        )
     else:
         enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+
+    # Configure per-layer GC interval for the Gemma transformer layers
+    model.paligemma_with_expert.gc_every_n_layers = config.gemma_gc_every_n_layers
+    logging.info(f"Gemma per-layer GC interval: every {config.gemma_gc_every_n_layers} layers (0=disabled)")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
@@ -430,12 +436,18 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
     if use_ddp:
+        ddp_bucket_cap_mb = config.ddp_bucket_cap_mb
+        logging.info(
+            f"DDP bucket_cap_mb={ddp_bucket_cap_mb} from config.ddp_bucket_cap_mb, "
+            f"find_unused_parameters={config.ddp_find_unused_parameters}"
+        )
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
+            find_unused_parameters=config.ddp_find_unused_parameters,
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            bucket_cap_mb=ddp_bucket_cap_mb,
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
@@ -461,6 +473,7 @@ def train_loop(config: _config.TrainConfig):
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        fused=True,
     )
 
     # Load checkpoint if resuming
@@ -506,110 +519,105 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    loader_iter = iter(loader)
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
-            # Check if we've reached the target number of steps
-            if global_step >= config.num_train_steps:
-                break
+        # Data loading
+        try:
+            observation, actions = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            observation, actions = next(loader_iter)
 
-            # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+        observation = jax.tree.map(lambda x: x.to(device), observation)
+        actions = actions.to(torch.float32)
+        actions = actions.to(device)
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+        # Update LR
+        for pg in optim.param_groups:
+            pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+        # Forward pass
+        losses = model(observation, actions)
+        # Ensure losses is a tensor and handle different return types
+        if isinstance(losses, list | tuple):
+            losses = torch.stack(losses)
+        elif not isinstance(losses, torch.Tensor):
+            losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+        loss = losses.mean()
 
-            # Backward pass
-            loss.backward()
+        # Backward pass
+        loss.backward()
 
-            # Log memory usage after backward pass
-            if global_step < 5 and is_main and torch.cuda.is_available():
-                log_memory_usage(device, global_step, "after_backward")
+        # Log memory usage after backward pass
+        if global_step < 5 and is_main and torch.cuda.is_available():
+            log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+        # Gradient clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
-            # Optimizer step
-            optim.step()
-            optim.zero_grad(set_to_none=True)
+        # Optimizer step
+        optim.step()
+        optim.zero_grad(set_to_none=True)
 
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+        # Collect stats
+        if is_main:
+            infos.append(
+                {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+            )
 
-            # Collect stats
-            if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+        if is_main and (global_step % config.log_interval == 0):
+            elapsed = time.time() - start_time
 
-            if is_main and (global_step % config.log_interval == 0):
-                elapsed = time.time() - start_time
+            # Average stats over log interval
+            avg_loss = sum(info["loss"] for info in infos) / len(infos)
+            avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
-                # Average stats over log interval
-                avg_loss = sum(info["loss"] for info in infos) / len(infos)
-                avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+            avg_grad_norm = None
+            if any("grad_norm" in info for info in infos):
+                vals = [info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None]
+                if len(vals) > 0:
+                    avg_grad_norm = sum(vals) / len(vals)
+            logging.info(
+                f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                if avg_grad_norm is not None
+                else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+            )
 
-                avg_grad_norm = None
-                if any("grad_norm" in info for info in infos):
-                    vals = [
-                        info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None
-                    ]
-                    if len(vals) > 0:
-                        avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+            # Log to wandb
+            if config.wandb_enabled and len(infos) > 0:
+                log_payload = {
+                    "loss": avg_loss,
+                    "learning_rate": avg_lr,
+                    "step": global_step,
+                    "time_per_step": elapsed / config.log_interval,
+                }
+                if avg_grad_norm is not None:
+                    log_payload["grad_norm"] = avg_grad_norm
+                wandb.log(log_payload, step=global_step)
 
-                # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
-                    log_payload = {
-                        "loss": avg_loss,
-                        "learning_rate": avg_lr,
-                        "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
-                    }
-                    if avg_grad_norm is not None:
-                        log_payload["grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
+            start_time = time.time()
+            infos = []  # Reset stats collection
 
-                start_time = time.time()
-                infos = []  # Reset stats collection
+        global_step += 1
 
-            global_step += 1
-            # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+        # Save checkpoint using the new mechanism
+        save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
-            # Update progress bar
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
-                )
+        # Update progress bar
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix(
+                {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+            )
 
     # Close progress bar
     if pbar is not None:
